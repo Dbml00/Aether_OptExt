@@ -194,5 +194,10 @@ pub fn apply(procs: &[(i32, String, Vec<(i32, String, String)>)], rescan: &std::
     if rescan.load(std::sync::atomic::Ordering::Acquire) {
         bound_set.clear();
     }
-    info!("已绑核 {} 进程 {} 线程", procs.len(), n);
+    let total: usize = procs.iter().map(|(_, _, th)| th.len()).sum();
+    if n > 0 {
+        info!("已绑核 {} 进程 {} 线程 (+{} 新)", procs.len(), total, n);
+    } else {
+        info!("已绑核 {} 进程 {} 线程 (无变动)", procs.len(), total);
+    }
 }

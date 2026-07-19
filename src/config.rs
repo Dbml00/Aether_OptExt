@@ -141,27 +141,36 @@ pub mod cache {
         for n in &big_names { comm_map.entry(big).or_default().push(n); }
         for n in &mid_names { comm_map.entry(mid).or_default().push(n); }
 
-        let comm_json = if big_names.is_empty() && mid_names.is_empty() { String::new() } else {
-            let parts: Vec<String> = comm_map.iter().map(|(c, ns)| {
-                let arr = ns.iter().map(|n| format!("\"{}\"", n)).collect::<Vec<_>>().join(",\n        ");
-                format!("        \"{}\": [\n        {}\n        ]", c, arr)
-            }).collect();
-            format!(",\n      \"comm\": {{\n{}\n      }}", parts.join(",\n"))
-        };
+        let entry_obj = json::object::Object::new();
 
-        let entry = format!(
-            "  {{\n    \"friendly\": \"[auto] {}\",\n    \"packages\": [\"{}\"],\n    \"cpuset\": {{\n      \"other\": \"{}\"{}\n    }}\n  }}",
-            pkg, pkg, little, comm_json
-        );
+        let entry_obj = json::object::Object::new();
+        let mut entry = json::JsonValue::new_object();
+        entry["friendly"] = json::JsonValue::String(format!("[auto] {}", pkg));
+        let mut pkgs = json::JsonValue::new_array();
+        let _ = pkgs.push(pkg);
+        entry["packages"] = pkgs;
+        let mut cs = json::JsonValue::new_object();
+        cs["other"] = json::JsonValue::String(little.to_string());
+        if !big_names.is_empty() || !mid_names.is_empty() {
+            let mut cm = json::JsonValue::new_object();
+            for (cpus, ns) in &comm_map {
+                let mut arr = json::JsonValue::new_array();
+                for n in ns { let _ = arr.push(*n); }
+                cm[*cpus] = arr;
+            }
+            cs["comm"] = cm;
+        }
+        entry["cpuset"] = cs;
 
         let _ = fs::create_dir_all("/sdcard/Android/Aether");
         let old = fs::read_to_string(FILE).unwrap_or_default();
+        let entry_str = json::stringify_pretty(entry, 2);
         let new = if old.trim().is_empty() || !old.trim_start().starts_with('[') {
-            format!("[\n{}\n]\n", entry)
+            format!("[\n{}\n]\n", entry_str)
         } else {
             let t = old.trim_end();
             let ins = if t.ends_with(']') { &t[..t.len()-1] } else { t };
-            format!("{},\n{}\n]\n", ins.trim_end(), entry)
+            format!("{},\n{}\n]\n", ins.trim_end(), entry_str)
         };
         let _ = fs::write(FILE, new.as_bytes());
     }
