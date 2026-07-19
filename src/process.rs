@@ -36,18 +36,19 @@ fn cpuset_add(tid: i32, cpus: &str) {
 
 pub fn scan(rules: &[Rule], set: &HashSet<String>, wild: &[String]) -> Vec<(i32, String, Vec<(i32, String, String)>)> {
     let mut result = Vec::new();
-    let mut buf = [0i8; 8192];
+    let mut buf = [0u8; 8192];
     let fd = unsafe { libc::open("/proc\0".as_ptr() as *const _, libc::O_RDONLY | libc::O_DIRECTORY) };
     if fd < 0 { return result; }
     loop {
-        let n = unsafe { libc::syscall(libc::SYS_getdents64, fd, buf.as_mut_ptr(), buf.len()) };
+        let n = unsafe { libc::syscall(libc::SYS_getdents64, fd, buf.as_mut_ptr() as *mut i8, buf.len()) };
         if n <= 0 { break; }
         let mut off = 0usize;
         while off < n as usize {
-            let rec = u16::from_ne_bytes(buf[off+16..off+18].try_into().unwrap_or([0;2])) as usize;
-            let ino = u64::from_ne_bytes(buf[off..off+8].try_into().unwrap_or([0;8]));
+            let rec = u16::from_ne_bytes([buf[off+16], buf[off+17]]) as usize;
+            let ino = u64::from_ne_bytes(buf[off..off+8].try_into().unwrap_or([0u8;8]));
             if rec < 19 || ino == 0 { off += rec; continue; }
-            let name = std::str::from_utf8(&buf[off+19..off+rec-1]).unwrap_or("");
+            let name_end = buf[off+19..off+rec].iter().position(|&b| b == 0).unwrap_or(rec-20);
+            let name = std::str::from_utf8(&buf[off+19..off+19+name_end]).unwrap_or("");
             off += rec;
             let pid: i32 = match name.parse() { Ok(p) => p, Err(_) => continue };
             if pid < 1000 { continue; }
@@ -77,6 +78,34 @@ pub fn scan(rules: &[Rule], set: &HashSet<String>, wild: &[String]) -> Vec<(i32,
     }
     unsafe { libc::close(fd); }
     result
+}
+
+/// 扫描单个 PID，返回匹配的进程数据
+pub fn scan_one_pid(pid: i32, rules: &[Rule], set: &HashSet<String>, wild: &[String])
+    -> Option<(i32, String, Vec<(i32, String, String)>)>
+{
+    if pid < 1000 { return None; }
+    let cl = fs::read_to_string(format!("/proc/{}/cmdline", pid)).ok()?;
+    let pkg = cl.split('\0').next().unwrap_or("").trim_end_matches('\0').to_string();
+    if pkg.is_empty() { return None; }
+    if !set.contains(&pkg) && !wild.iter().any(|w| fnmatch(w, &pkg)) { return None; }
+    let mut th = Vec::new();
+    if let Ok(tk) = fs::read_dir(format!("/proc/{}/task", pid)) {
+        for t in tk.flatten() {
+            let tid: i32 = t.file_name().to_string_lossy().parse().unwrap_or(0);
+            let comm = fs::read_to_string(t.path().join("comm")).unwrap_or_default().trim().to_string();
+            let mut best = String::new(); let mut bp = -1i32;
+            for r in rules {
+                let pm = r.pkg == pkg || (r.thread.is_empty() && fnmatch(&r.pkg, &pkg));
+                if !pm { continue; }
+                if r.thread.is_empty() { if 200 > bp { best = r.cpus.clone(); bp = 200; } }
+                else if fnmatch(&r.thread, &comm) && r.prio > bp { best = r.cpus.clone(); bp = r.prio; }
+            }
+            th.push((tid, comm, best));
+        }
+    }
+    if th.is_empty() { return None; }
+    Some((pid, pkg, th))
 }
 
 /// 扫描未配置的用户应用，用于自动分配
@@ -116,19 +145,21 @@ pub fn scan_unknown(set: &HashSet<String>, wild: &[String]) -> Vec<(i32, String,
     result
 }
 
-/// 应用绑核
-pub fn apply(procs: &[(i32, String, Vec<(i32, String, String)>)], rescan: &std::sync::atomic::AtomicBool) {
+/// 应用绑核 (增量模式: 跳过已绑线程)
+pub fn apply(procs: &[(i32, String, Vec<(i32, String, String)>)], rescan: &std::sync::atomic::AtomicBool,
+    bound_set: &mut std::collections::HashSet<(i32, String)>) {
     let mut seen_cpus = std::collections::HashSet::<String>::new();
     let mut n = 0usize;
+    let mut new_set = std::collections::HashSet::new();
     for (_, _, th) in procs {
         for (tid, _, cpus) in th {
             if cpus.is_empty() { continue; }
+            let key = (*tid, cpus.clone());
+            if bound_set.contains(&key) { continue; }  // 已绑, 跳过
             n += 1;
 
             // 确保 cpuset 目录存在 (仅首次)
-            if seen_cpus.insert(cpus.clone()) {
-                ensure_cpuset(cpus);
-            }
+            if seen_cpus.insert(cpus.clone()) { ensure_cpuset(cpus); }
 
             // sched_setaffinity
             let mut set: libc::cpu_set_t = unsafe { mem::zeroed() };
@@ -154,7 +185,14 @@ pub fn apply(procs: &[(i32, String, Vec<(i32, String, String)>)], rescan: &std::
 
             // cpuset 写入
             cpuset_add(*tid, cpus);
+            new_set.insert(key);
         }
+    }
+    // 合并新绑的到持久集合
+    for k in new_set { bound_set.insert(k); }
+    // 清理已退出的线程 (ESRCH)
+    if rescan.load(std::sync::atomic::Ordering::Acquire) {
+        bound_set.clear();
     }
     info!("已绑核 {} 进程 {} 线程", procs.len(), n);
 }

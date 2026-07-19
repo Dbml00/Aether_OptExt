@@ -112,7 +112,7 @@ pub mod cache {
         info!("已加载 {} 条缓存", root.members().count());
     }
 
-    pub fn save(pkg: &str, all: &[(i32, String, Vec<(i32, String)>)], big: &str, little: &str) {
+    pub fn save(pkg: &str, all: &[(i32, String, Vec<(i32, String)>)], big: &str, mid: &str, little: &str) {
         // 只过滤特定系统服务，不过滤全部 MIUI/Xiaomi
         if pkg.ends_with(":widgetProvider") || pkg.ends_with(":searchDataService")
             || pkg.ends_with(":coreService") || pkg.ends_with(":cognitionService")
@@ -124,11 +124,14 @@ pub mod cache {
             || pkg.starts_with(".qms") || pkg.starts_with(".cacert")
             || pkg.starts_with(".dataservices") { return; }
         let mut big_names = Vec::new();
+        let mut mid_names = Vec::new();
         let mut lil_names = Vec::new();
+        let has_mid = !mid.is_empty();
         for (_, n, th) in all.iter().filter(|(_, n, _)| n == pkg) {
             for (_, comm) in th {
                 let load = est_load(comm);
                 if load >= 8 { big_names.push(comm.clone()); }
+                else if load >= 5 && has_mid { mid_names.push(comm.clone()); }
                 else { lil_names.push(comm.clone()); }
 
             }
@@ -136,8 +139,9 @@ pub mod cache {
 
         let mut comm_map: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
         for n in &big_names { comm_map.entry(big).or_default().push(n); }
+        for n in &mid_names { comm_map.entry(mid).or_default().push(n); }
 
-        let comm_json = if big_names.is_empty() { String::new() } else {
+        let comm_json = if big_names.is_empty() && mid_names.is_empty() { String::new() } else {
             let parts: Vec<String> = comm_map.iter().map(|(c, ns)| {
                 let arr = ns.iter().map(|n| format!("\"{}\"", n)).collect::<Vec<_>>().join(",\n        ");
                 format!("        \"{}\": [\n        {}\n        ]", c, arr)
@@ -163,13 +167,13 @@ pub mod cache {
     }
 
     fn est_load(name: &str) -> i32 {
-
         if name.contains("Render") || name.contains("Gfx") || name.contains("GL") || name.contains("Vulkan") { return 10; }
         if name.contains("Decode") || name.contains("Codec") || name.contains("Video") || name.contains("Audio") { return 8; }
-        if name.contains("Main") || name.contains("Unity") || name.contains("Game") { return 9; }
+        if name.contains("Main") || name.contains("Unity") || name.contains("Game")
+            || name.contains("Native") || name.contains("RHI") || name.contains("TaskGraph") { return 9; }
         if name.contains("Worker") || name.contains("Thread") || name.contains("Job") { return 5; }
         if name.contains("Io") || name.contains("Network") || name.contains("Http") { return 3; }
         if name.contains("Background") || name.contains("Idle") || name.contains("Pool") { return 1; }
-        4
+        5
     }
 }
