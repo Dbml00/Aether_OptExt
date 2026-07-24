@@ -5,3 +5,6 @@ magisk_module/aether-optext
 *.swp
 *~
 .DS_Store
+__pycache__/
+*.o
+src/bpf_prog.rs

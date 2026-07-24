@@ -37,6 +37,16 @@ impl AppConfig {
     pub fn load(path: &str) -> Option<Self> {
         let data = fs::read_to_string(path).ok()?;
         let root = json::parse(&data).ok()?;
+
+        // 彩蛋
+        if root["nekonemo"].as_str() == Some("meow") {
+            let count = if root.is_object() { root.entries().count() } else { 0 };
+            if count <= 1 {
+                info!("嗷呜~💗艇长才不是猫娘喵！！！");
+                return None;
+            }
+        }
+
         let ebpf = root["features"]["ebpf"].as_bool().unwrap_or(true);
         let entries = if root.is_array() { &root } else { &root["rules"] };
         if !entries.is_array() { return None; }
@@ -90,10 +100,13 @@ pub mod cache {
         let data = match fs::read_to_string(FILE) { Ok(x) => x, Err(_) => return };
         let root = match json::parse(&data) { Ok(x) => x, Err(_) => return };
         if !root.is_array() { return; }
+        let mut seen_pkgs = HashSet::new();
         for entry in root.members() {
             let pl: Vec<String> = entry["packages"].members()
                 .filter_map(|v| v.as_str().map(String::from)).collect();
             if pl.is_empty() { continue; }
+            // 去重：同名包只保留最后一条（最新）
+            if !seen_pkgs.insert(pl[0].clone()) { continue; }
             let other = entry["cpuset"]["other"].as_str().unwrap_or("0");
             for pk in &pl { set.insert(pk.clone()); }
             rules.push(Rule { pkg: pl[0].clone(), thread: String::new(), cpus: other.to_string(), prio: 200 });
@@ -109,9 +122,10 @@ pub mod cache {
                 }
             }
         }
-        info!("已加载 {} 条缓存", root.members().count());
+        info!("已加载 {} 条缓存", seen_pkgs.len());
     }
 
+    /// 用 JSON 库读写 cache，按包名去重覆盖（避免无限膨胀）
     pub fn save(pkg: &str, all: &[(i32, String, Vec<(i32, String)>)], big: &str, mid: &str, little: &str) {
         // 只过滤特定系统服务，不过滤全部 MIUI/Xiaomi
         if pkg.ends_with(":widgetProvider") || pkg.ends_with(":searchDataService")
@@ -127,7 +141,7 @@ pub mod cache {
         let mut mid_names = Vec::new();
         let mut lil_names = Vec::new();
         let has_mid = !mid.is_empty();
-        for (_, n, th) in all.iter().filter(|(_, n, _)| n == pkg) {
+        for (_, _, th) in all.iter().filter(|(_, n, _)| n == pkg) {
             for (_, comm) in th {
                 let load = est_load(comm);
                 if load >= 8 { big_names.push(comm.clone()); }
@@ -141,9 +155,6 @@ pub mod cache {
         for n in &big_names { comm_map.entry(big).or_default().push(n); }
         for n in &mid_names { comm_map.entry(mid).or_default().push(n); }
 
-        let entry_obj = json::object::Object::new();
-
-        let entry_obj = json::object::Object::new();
         let mut entry = json::JsonValue::new_object();
         entry["friendly"] = json::JsonValue::String(format!("[auto] {}", pkg));
         let mut pkgs = json::JsonValue::new_array();
@@ -163,16 +174,26 @@ pub mod cache {
         entry["cpuset"] = cs;
 
         let _ = fs::create_dir_all("/sdcard/Android/Aether");
+        // 用 JSON 库读写，按包名去重
         let old = fs::read_to_string(FILE).unwrap_or_default();
-        let entry_str = json::stringify_pretty(entry, 2);
-        let new = if old.trim().is_empty() || !old.trim_start().starts_with('[') {
-            format!("[\n{}\n]\n", entry_str)
+        let arr: json::JsonValue = if old.trim().is_empty() || !old.trim_start().starts_with('[') {
+            json::JsonValue::new_array()
         } else {
-            let t = old.trim_end();
-            let ins = if t.ends_with(']') { &t[..t.len()-1] } else { t };
-            format!("{},\n{}\n]\n", ins.trim_end(), entry_str)
+            json::parse(&old).unwrap_or(json::JsonValue::new_array())
         };
-        let _ = fs::write(FILE, new.as_bytes());
+        // 去重：过滤掉同名包名的老条目
+        let mut deduped = json::JsonValue::new_array();
+        for e in arr.members() {
+            let keep = match e["packages"][0].as_str() {
+                Some(old_pkg) => old_pkg != pkg,
+                None => true,
+            };
+            if keep {
+                let _ = deduped.push(e.clone());
+            }
+        }
+        let _ = deduped.push(entry);
+        let _ = fs::write(FILE, json::stringify_pretty(deduped, 2).as_bytes());
     }
 
     fn est_load(name: &str) -> i32 {

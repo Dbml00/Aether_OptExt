@@ -39,9 +39,9 @@ pub fn scan(rules: &[Rule], set: &HashSet<String>, wild: &[String]) -> Vec<(i32,
     let mut buf = [0u8; 8192];
     let fd = unsafe { libc::open("/proc\0".as_ptr() as *const _, libc::O_RDONLY | libc::O_DIRECTORY) };
     if fd < 0 { return result; }
-    loop {
+    let r = loop {
         let n = unsafe { libc::syscall(libc::SYS_getdents64, fd, buf.as_mut_ptr() as *mut i8, buf.len()) };
-        if n <= 0 { break; }
+        if n <= 0 { break n; }
         let mut off = 0usize;
         while off < n as usize {
             let rec = u16::from_ne_bytes([buf[off+16], buf[off+17]]) as usize;
@@ -52,31 +52,11 @@ pub fn scan(rules: &[Rule], set: &HashSet<String>, wild: &[String]) -> Vec<(i32,
             off += rec;
             let pid: i32 = match name.parse() { Ok(p) => p, Err(_) => continue };
             if pid < 1000 { continue; }
-            let cl = fs::read_to_string(format!("/proc/{}/cmdline", pid)).unwrap_or_default();
-            let pkg = cl.split('\0').next().unwrap_or("").trim_end_matches('\0').to_string();
-        if pkg.is_empty() { continue; }
-        if !set.contains(&pkg) && !wild.iter().any(|w| fnmatch(w, &pkg)) { continue; }
-        let mut th = Vec::new();
-        if let Ok(tk) = fs::read_dir(format!("/proc/{}/task", pid)) {
-            for t in tk.flatten() {
-                let tid: i32 = t.file_name().to_string_lossy().parse().unwrap_or(0);
-                let comm = fs::read_to_string(t.path().join("comm")).unwrap_or_default().trim().to_string();
-                let mut best = String::new();
-                let mut bp = -1i32;
-                for r in rules {
-                    let pm = r.pkg == pkg || (r.thread.is_empty() && fnmatch(&r.pkg, &pkg));
-                    if !pm { continue; }
-                    if r.thread.is_empty() { if 200 > bp { best = r.cpus.clone(); bp = 200; } }
-                    else if fnmatch(&r.thread, &comm) && r.prio > bp { best = r.cpus.clone(); bp = r.prio; }
-                }
-                th.push((tid, comm, best));
-            }
+            if let Some(entry) = scan_one_pid(pid, rules, set, wild) { result.push(entry); }
         }
-        if th.is_empty() { continue; }
-        result.push((pid, pkg, th));
-        }
-    }
+    };
     unsafe { libc::close(fd); }
+    if r < 0 { result.clear(); }
     result
 }
 
@@ -115,8 +95,15 @@ pub fn scan_unknown(set: &HashSet<String>, wild: &[String]) -> Vec<(i32, String,
     for entry in dir.flatten() {
         let pid: i32 = match entry.file_name().to_string_lossy().parse() { Ok(p) => p, Err(_) => continue };
         if pid < 1000 { continue; }
-        let mut is_user = false;
+        // 先读 cmdline（轻量），粗筛：包名必须含 '.' 且不含 '/'
+        let cl = match fs::read_to_string(entry.path().join("cmdline")) { Ok(c) => c, Err(_) => continue };
+        let pkg = cl.split('\0').next().unwrap_or("").trim_end_matches('\0').to_string();
+        if pkg.is_empty() || pkg.contains('/') || !pkg.contains('.') { continue; }
+        // 已收录的跳过
+        if set.contains(&pkg) || wild.iter().any(|w| fnmatch(w, &pkg)) { continue; }
+        // 再读 status 验证 UID >= 10000（确认是用户应用）
         if let Ok(st) = fs::read_to_string(entry.path().join("status")) {
+            let mut is_user = false;
             for line in st.lines() {
                 if line.starts_with("Uid:") {
                     if let Some(u) = line.split_whitespace().nth(1) {
@@ -125,12 +112,8 @@ pub fn scan_unknown(set: &HashSet<String>, wild: &[String]) -> Vec<(i32, String,
                     break;
                 }
             }
-        }
-        if !is_user { continue; }
-        let cl = fs::read_to_string(entry.path().join("cmdline")).unwrap_or_default();
-        let pkg = cl.split('\0').next().unwrap_or("").trim_end_matches('\0').to_string();
-        if pkg.is_empty() || pkg.contains('/') || !pkg.contains('.') { continue; }
-        if set.contains(&pkg) || wild.iter().any(|w| fnmatch(w, &pkg)) { continue; }
+            if !is_user { continue; }
+        } else { continue; }
         let mut th = Vec::new();
         if let Ok(tk) = fs::read_dir(entry.path().join("task")) {
             for t in tk.flatten() {
@@ -145,9 +128,25 @@ pub fn scan_unknown(set: &HashSet<String>, wild: &[String]) -> Vec<(i32, String,
     result
 }
 
+/// 解析 CPU range 字符串（如 "0-3,4,6-7"）并设置 cpu_set_t
+pub fn parse_cpus_to_set(cpus: &str, set: &mut libc::cpu_set_t) {
+    for part in cpus.split(',') {
+        let part = part.trim();
+        if part.is_empty() { continue; }
+        if let Some((s, e)) = part.split_once('-') {
+            let start: usize = s.parse().unwrap_or(0);
+            let end: usize = e.parse().unwrap_or(start);
+            for cpu in start..=end { unsafe { libc::CPU_SET(cpu, set); } }
+        } else if let Ok(cpu) = part.parse::<usize>() {
+            unsafe { libc::CPU_SET(cpu, set); }
+        }
+    }
+}
+
 /// 应用绑核 (增量模式: 跳过已绑线程)
-pub fn apply(procs: &[(i32, String, Vec<(i32, String, String)>)], rescan: &std::sync::atomic::AtomicBool,
-    bound_set: &mut std::collections::HashSet<(i32, String)>) {
+/// 返回 (绑定的进程数, 总线程数, 新增绑定数)
+pub fn apply(procs: &[(i32, String, Vec<(i32, String, String)>)],
+    bound_set: &mut std::collections::HashSet<(i32, String)>) -> (usize, usize, usize) {
     let mut seen_cpus = std::collections::HashSet::<String>::new();
     let mut n = 0usize;
     let mut new_set = std::collections::HashSet::new();
@@ -164,40 +163,17 @@ pub fn apply(procs: &[(i32, String, Vec<(i32, String, String)>)], rescan: &std::
             // sched_setaffinity
             let mut set: libc::cpu_set_t = unsafe { mem::zeroed() };
             unsafe { libc::CPU_ZERO(&mut set); }
-            for part in cpus.split(',') {
-                let part = part.trim();
-                if part.is_empty() { continue; }
-                if let Some((s, e)) = part.split_once('-') {
-                    let start: usize = match s.parse() { Ok(v) => v, Err(_) => continue };
-                    let end: usize = match e.parse() { Ok(v) => v, Err(_) => continue };
-                    for cpu in start..=end { unsafe { libc::CPU_SET(cpu, &mut set); } }
-                } else if let Ok(cpu) = part.parse::<usize>() {
-                    unsafe { libc::CPU_SET(cpu, &mut set); }
-                }
-            }
+            parse_cpus_to_set(cpus, &mut set);
             unsafe {
-                if libc::sched_setaffinity(*tid, mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
-                    if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                        rescan.store(true, std::sync::atomic::Ordering::Release);
-                    }
-                }
+                libc::sched_setaffinity(*tid, mem::size_of::<libc::cpu_set_t>(), &set);
+                // ESRCH: 线程已退出, 直接跳过
             }
 
-            // cpuset 写入
             cpuset_add(*tid, cpus);
             new_set.insert(key);
         }
     }
-    // 合并新绑的到持久集合
     for k in new_set { bound_set.insert(k); }
-    // 清理已退出的线程 (ESRCH)
-    if rescan.load(std::sync::atomic::Ordering::Acquire) {
-        bound_set.clear();
-    }
     let total: usize = procs.iter().map(|(_, _, th)| th.len()).sum();
-    if n > 0 {
-        info!("已绑核 {} 进程 {} 线程 (+{} 新)", procs.len(), total, n);
-    } else {
-        info!("已绑核 {} 进程 {} 线程 (无变动)", procs.len(), total);
-    }
+    (procs.len(), total, n)
 }

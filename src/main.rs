@@ -1,9 +1,7 @@
 use std::{
-    env, fs, io::Write, mem,
+    env, fs, io::Write,
     path::Path,
-    sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, SystemTime},
-    collections::HashSet,
+    time::Duration,
 };
 
 #[macro_use]
@@ -12,6 +10,8 @@ mod config;
 mod cpu;
 mod process;
 mod bpf;
+#[cfg(target_os = "android")]
+mod bpf_prog;
 
 use log::*;
 use config::*;
@@ -55,7 +55,6 @@ fn main() {
     info!("已加载 {} 条规则", cfg.rules.len());
 
     // 合并缓存
-    let all_w = &cfg.wild;
     cache::merge(&mut cfg.pkg_set, &mut cfg.rules);
     info!("共 {} 条规则 (含缓存)", cfg.rules.len());
 
@@ -70,19 +69,9 @@ fn main() {
         let self_pid = std::process::id() as i32;
         let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
         unsafe { libc::CPU_ZERO(&mut set); }
-        for part in little.split(',') {
-            let part = part.trim();
-            if part.is_empty() { continue; }
-            if let Some((s, e)) = part.split_once('-') {
-                let start: usize = s.parse().unwrap_or(0);
-                let end: usize = e.parse().unwrap_or(start);
-                for cpu in start..=end { unsafe { libc::CPU_SET(cpu, &mut set); } }
-            } else if let Ok(cpu) = part.parse::<usize>() {
-                unsafe { libc::CPU_SET(cpu, &mut set); }
-            }
-        }
+        process::parse_cpus_to_set(&little, &mut set);
         let r = unsafe { libc::sched_setaffinity(self_pid, std::mem::size_of::<libc::cpu_set_t>(), &set) };
-        if r != 0 { info!("自身绑核跳过 (errno={})", std::io::Error::last_os_error().raw_os_error().unwrap_or(0)); }
+        if r != 0 { info!("自身绑核跳过 (errno={})", r); }
     }
 
     // eBPF
@@ -96,8 +85,8 @@ fn main() {
     let _ = fs::create_dir_all("/sdcard/Android/Aether");
 
     // 启动时自动分配
-    let unknown = process::scan_unknown(&cfg.pkg_set, all_w);
-    for (pid, pkg, th) in &unknown {
+    let unknown = process::scan_unknown(&cfg.pkg_set, &cfg.wild);
+    for (_, pkg, th) in &unknown {
         info!("新应用: {} ({} 线程)", pkg, th.len());
         cache::save(pkg, &unknown, &big, &mid, &little);
     }
@@ -106,10 +95,9 @@ fn main() {
         info!("自动分配完成: {} 个", unknown.len());
     }
 
-    let mut cache = process::scan(&cfg.rules, &cfg.pkg_set, all_w);
+    let mut cache = process::scan(&cfg.rules, &cfg.pkg_set, &cfg.wild);
     let mut cnt = 1i32;
     let mut cache_scan = 0i32;
-    let rf = AtomicBool::new(false);
     let mut bound_set = std::collections::HashSet::<(i32, String)>::new();
     let mut bind_cycle = 0i32;
     let efd = unsafe { libc::epoll_create1(0) };
@@ -124,7 +112,7 @@ fn main() {
         // eBPF 事件驱动 (epoll 即时唤醒)
         if bpf.ok {
             for pid in bpf::poll_new_pids(&bpf) {
-                if let Some(entry) = process::scan_one_pid(pid, &cfg.rules, &cfg.pkg_set, all_w) {
+                if let Some(entry) = process::scan_one_pid(pid, &cfg.rules, &cfg.pkg_set, &cfg.wild) {
                     if let Some(pos) = cache.iter().position(|(p, _, _)| *p == pid) {
                         cache[pos] = entry;
                     } else {
@@ -135,12 +123,28 @@ fn main() {
             }
         }
 
-        // 定期扫描新应用
+        // 定期扫描新应用 + 检查配置热加载
         cache_scan += 1;
         if cache_scan >= 30 {
             cache_scan = 0;
-            let u = process::scan_unknown(&cfg.pkg_set, all_w);
-            for (pid, pkg, th) in &u {
+            // 配置热加载: 检查 mtime 是否变化
+            if let Ok(mt) = fs::metadata(&config_path).and_then(|m| m.modified()) {
+                if mt > cfg.mtime {
+                    info!("检测到配置变更, 热加载...");
+                    if let Some(new_cfg) = AppConfig::load(&config_path) {
+                        cfg = new_cfg;
+                        let _ = process::scan(&cfg.rules, &cfg.pkg_set, &cfg.wild); // 预热
+                        if bpf.ok { bpf::sync_rules(&bpf, &cfg.rules); }
+                        cache::merge(&mut cfg.pkg_set, &mut cfg.rules);
+                        bound_set.clear();
+                        info!("配置已热加载, 共 {} 条规则", cfg.rules.len());
+                    } else {
+                        info!("配置文件解析失败, 保持旧配置");
+                    }
+                }
+            }
+            let u = process::scan_unknown(&cfg.pkg_set, &cfg.wild);
+            for (_, pkg, th) in &u {
                 info!("新应用: {} ({} 线程)", pkg, th.len());
                 cache::save(pkg, &u, &big, &mid, &little);
             }
@@ -152,26 +156,23 @@ fn main() {
 
         cnt -= 1;
         if cnt < 1 {
-            process::apply(&cache, &rf, &mut bound_set);
+            let (np, nt, nb) = process::apply(&cache, &mut bound_set);
+            if nb > 0 {
+                info!("已绑核 {} 进程 {} 线程 (+{} 新)", np, nt, nb);
+            }
             bind_cycle += 1;
             if bind_cycle >= 30 {
                 bind_cycle = 0;
                 bound_set.clear();  // 全量重绑
             }
-            if rf.load(Ordering::Acquire) {
-                cache = process::scan(&cfg.rules, &cfg.pkg_set, all_w);
-                rf.store(false, Ordering::Release);
-            }
             cnt = 1;
         }
 
-        std::thread::sleep(Duration::from_secs(interval));
-        // epoll 等待 ringbuf 事件 (即时响应, 0% CPU)
-        if efd >= 0 {
-            let mut _evs: [libc::epoll_event; 1] = [libc::epoll_event { events: 0, u64: 0 }];
-            unsafe { libc::epoll_wait(efd, _evs.as_mut_ptr(), 1, (interval * 1000) as i32); }
-        } else {
-            std::thread::sleep(Duration::from_secs(interval));
+        // 第一原则：不空转。保底 sleep + epoll 提前唤醒，总等待 ≈ interval。
+        std::thread::sleep(Duration::from_millis(interval * 500)); // 至少等一半
+        if efd >= 0 && bpf.ok {
+            let mut evs: [libc::epoll_event; 1] = [libc::epoll_event { events: 0, u64: 0 }];
+            unsafe { libc::epoll_wait(efd, evs.as_mut_ptr(), 1, (interval * 500) as i32); } // 最多再等一半
         }
     }
 }
