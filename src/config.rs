@@ -21,7 +21,10 @@ pub struct Rule {
     pub pkg: String,
     pub thread: String,
     pub cpus: String,
+    #[allow(dead_code)]
     pub prio: i32,
+    /// 包级规则的 cpuset 子目录（load 时预生成）；线程规则为空，匹配时按合并集合创建
+    pub cpuset_dir: String,
 }
 
 #[derive(Clone)]
@@ -31,10 +34,11 @@ pub struct AppConfig {
     pub wild: Vec<String>,
     pub mtime: SystemTime,
     pub ebpf: bool,
+    pub topo: crate::cpuset::CpuTopology,
 }
 
 impl AppConfig {
-    pub fn load(path: &str) -> Option<Self> {
+    pub fn load(path: &str, topo: &crate::cpuset::CpuTopology) -> Option<Self> {
         let data = fs::read_to_string(path).ok()?;
         let root = json::parse(&data).ok()?;
 
@@ -47,7 +51,7 @@ impl AppConfig {
             }
         }
 
-        let ebpf = root["features"]["ebpf"].as_bool().unwrap_or(true);
+        let ebpf = root["features"]["ebpf"].as_bool().unwrap_or(false);
         let entries = if root.is_array() { &root } else { &root["rules"] };
         if !entries.is_array() { return None; }
 
@@ -67,7 +71,17 @@ impl AppConfig {
                 if pk.contains('*') || pk.contains('?') { wild.push(pk.clone()); }
             }
 
-            rules.push(Rule { pkg: def.clone(), thread: String::new(), cpus: other.to_string(), prio: 200 });
+            let other_set = crate::cpuset::from_range(other);
+            let other_dir = other_set.to_range_string();
+            let other_cpuset_dir = if topo.cpuset_enabled {
+                crate::cpuset::create_cpuset_dir(
+                    &format!("{}/{}", crate::common::base_cpuset(), other_dir),
+                    &other_dir, &topo.mems_str,
+                ).then_some(other_dir).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            rules.push(Rule { pkg: def.clone(), thread: String::new(), cpus: other.to_string(), prio: 200, cpuset_dir: other_cpuset_dir });
 
             if e["cpuset"]["comm"].is_object() {
                 for (cpus, names) in e["cpuset"]["comm"].entries() {
@@ -78,6 +92,7 @@ impl AppConfig {
                                 thread: name.to_string(),
                                 cpus: cpus.to_string(),
                                 prio: rule_prio(name),
+                                cpuset_dir: String::new(),
                             });
                         }
                     }
@@ -86,13 +101,18 @@ impl AppConfig {
         }
 
         let mt = fs::metadata(path).ok()?.modified().ok()?;
-        Some(AppConfig { rules, pkg_set, wild, mtime: mt, ebpf })
+        Some(AppConfig { rules, pkg_set, wild, mtime: mt, ebpf, topo: topo.clone() })
+    }
+
+    /// 该包是否存在线程级规则
+    pub fn pkg_has_thread_rules(&self, pkg: &str) -> bool {
+        self.rules.iter().any(|r| !r.thread.is_empty() && fnmatch(&r.pkg, pkg))
     }
 }
 
 pub mod cache {
     use std::{collections::HashSet, fs};
-    use super::{Rule, fnmatch};
+    use super::Rule;
 
     const FILE: &str = "/sdcard/Android/Aether/threads_cache";
 
@@ -109,14 +129,12 @@ pub mod cache {
             if !seen_pkgs.insert(pl[0].clone()) { continue; }
             let other = entry["cpuset"]["other"].as_str().unwrap_or("0");
             for pk in &pl { set.insert(pk.clone()); }
-            rules.push(Rule { pkg: pl[0].clone(), thread: String::new(), cpus: other.to_string(), prio: 200 });
+            rules.push(Rule { pkg: pl[0].clone(), thread: String::new(), cpus: other.to_string(), prio: 200, cpuset_dir: String::new() });
             if entry["cpuset"]["comm"].is_object() {
                 for (cpus, names) in entry["cpuset"]["comm"].entries() {
                     for nv in names.members() {
                         if let Some(name) = nv.as_str() {
-                            let p = if !name.contains('*') && !name.contains('?') { 1000 + name.len() as i32 }
-                                    else { 100 + name.chars().filter(|c| *c != '*').count() as i32 };
-                            rules.push(Rule { pkg: pl[0].clone(), thread: name.to_string(), cpus: cpus.to_string(), prio: p });
+                            rules.push(Rule { pkg: pl[0].clone(), thread: name.to_string(), cpus: cpus.to_string(), prio: super::rule_prio(name), cpuset_dir: String::new() });
                         }
                     }
                 }
@@ -126,9 +144,9 @@ pub mod cache {
     }
 
     /// 用 JSON 库读写 cache，按包名去重覆盖（避免无限膨胀）
-    pub fn save(pkg: &str, all: &[(i32, String, Vec<(i32, String)>)], big: &str, mid: &str, little: &str) {
-        // 只过滤特定系统服务，不过滤全部 MIUI/Xiaomi
-        if pkg.ends_with(":widgetProvider") || pkg.ends_with(":searchDataService")
+    /// 黑名单: 已知无需记忆的系统服务
+    pub fn is_blacklisted(pkg: &str) -> bool {
+        pkg.ends_with(":widgetProvider") || pkg.ends_with(":searchDataService")
             || pkg.ends_with(":coreService") || pkg.ends_with(":cognitionService")
             || pkg.ends_with(":bert") || pkg.ends_with(":bertAlgo")
             || pkg.ends_with(":privacy") || pkg.ends_with(":kit7")
@@ -136,7 +154,11 @@ pub mod cache {
             || pkg == "android.process.media" || pkg == "android.process.acore"
             || pkg.starts_with("com.qualcomm.") || pkg.starts_with(".qti")
             || pkg.starts_with(".qms") || pkg.starts_with(".cacert")
-            || pkg.starts_with(".dataservices") { return; }
+            || pkg.starts_with(".dataservices")
+    }
+
+    pub fn save(pkg: &str, all: &[(i32, String, Vec<(i32, String)>)], big: &str, mid: &str, little: &str) {
+        if is_blacklisted(pkg) { return; }
         let mut big_names = Vec::new();
         let mut mid_names = Vec::new();
         let mut lil_names = Vec::new();

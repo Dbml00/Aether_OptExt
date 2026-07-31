@@ -1,6 +1,7 @@
 {
   "features": {
-    "ebpf": true
+    "ebpf": true,
+    "auto-for-none": true
   },
   "rules": [
     {

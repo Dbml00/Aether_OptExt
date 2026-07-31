@@ -1,0 +1,11 @@
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[build]
+target = "bpfel-unknown-none"
+
+[target.bpfel-unknown-none]
+linker = "bpf-linker"

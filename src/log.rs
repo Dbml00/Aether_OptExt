@@ -4,6 +4,7 @@ pub const PATH: &str = "/sdcard/Android/Aether/threads_log.txt";
 
 pub fn write(level: &str, msg: &str) {
     let mut now: libc::time_t = 0;
+    // SAFETY: tm 是 POD 零初始化安全；time()/localtime_r() 可重入，无数据竞争
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe {
         libc::time(&mut now);

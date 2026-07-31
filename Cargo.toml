@@ -16,3 +16,4 @@ opt-level = 3
 [dependencies]
 libc = "0.2"
 json = "0.12"
+aya = "0.14"

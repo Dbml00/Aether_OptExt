@@ -9,7 +9,7 @@ echo ""
 # 1. 内核版本
 KV=$(uname -r)
 echo "内核版本: $KV"
-echo "$KV" | grep -qE '^6\.' && echo "  → 支持 bpf_sched_setaffinity ✓" || echo "  → 不支持内核侧绑核"
+echo "$KV" | grep -qE '^6\.' && echo "  → 内核 >= 6.0 (eBPF 特性齐全) ✓" || echo "  → 内核 < 6.0 (基础 eBPF 仍可用)"
 echo ""
 
 # 2. 内核配置

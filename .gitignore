@@ -7,4 +7,5 @@ magisk_module/aether-optext
 .DS_Store
 __pycache__/
 *.o
-src/bpf_prog.rs
+/ebpf/target
+.reasonix/
