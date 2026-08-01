@@ -22,21 +22,25 @@ jobs:
           toolchain: stable
           targets: aarch64-linux-android
 
-      - name: Set up Android NDK (Fixed)
-        uses: nndroid/setup-ndk@v1
-        with:
-          ndk-version: r25c
-          add-to-path: true
-
-      - name: Run Build Script
+      - name: Build Module with System NDK
         run: |
-          # 修正 NDK 环境变量名
-          export ANDROID_NDK_HOME=$ANDROID_NDK_ROOT
+          # 1. 查找 GitHub 虚拟机自带的最新的 NDK 路径
+          NDK_PATH=$(ls -d $ANDROID_HOME/ndk/* | tail -1)
+          if [ -z "$NDK_PATH" ]; then
+            echo "Error: Android NDK not found in system."
+            exit 1
+          fi
+          echo "Using NDK from: $NDK_PATH"
+          
+          # 2. 设置项目所需的 ANDROID_NDK_HOME 环境变量
+          export ANDROID_NDK_HOME=$NDK_PATH
+          
+          # 3. 运行项目自带的 build.py 脚本进行编译
           python build.py
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Aether-OptExt-Module
+          # 根据 README，产物在 out 目录下
           path: out/*.zip
-
