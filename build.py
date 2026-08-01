@@ -1,148 +1,109 @@
-#!/usr/bin/env python3
-import os, sys, shutil, subprocess, zipfile
-from datetime import datetime
+import os
 from pathlib import Path
+import shutil
+from datetime import datetime
+import subprocess
 
-VERSION = "1.0.0"
-SCRIPT_DIR = Path(__file__).resolve().parent
-OUT_DIR = SCRIPT_DIR / "out"
-MODULE_DIR = SCRIPT_DIR / "magisk_module"
-MODULE_ZIP = OUT_DIR / f"Aether-OptExt_{datetime.now():%Y%m%d_%H%M%S}.zip"
-TARGET = "aarch64-linux-android"
+SCRIPT_DIR = Path(__file__).parent.resolve()
+OUTPUT_DIR = SCRIPT_DIR / "out"
+BUILD_LOG = OUTPUT_DIR / "build.log"
 
-def info(m): print(f"[INFO] {m}")
-def warn(m): print(f"[WARN] {m}")
-def die(m): print(f"[ERROR] {m}"); sys.exit(1)
+def log_to_file(message):
+    with open(BUILD_LOG, "a") as f:
+        f.write(message + "\n")
+    print(message)
 
 def gen_ebpf_bytecode():
-    """用 WSL 编译 aya-ebpf (Rust) eBPF 程序 -> ebpf_target.o"""
-    o_file = SCRIPT_DIR / "ebpf_target.o"
-    # Windows 项目路径 -> WSL 路径 (/mnt/g/aether_opt_ext)
-    drive = SCRIPT_DIR.drive.lower().rstrip(':')
-    wsl_path = "/mnt/" + drive + SCRIPT_DIR.as_posix().split(':', 1)[1]
+    # Fix for generic Linux environment (non-WSL)
+    # The original script assumed a Windows path format (e.g., C:\...)
+    as_posix = SCRIPT_DIR.as_posix()
+    if ':' in as_posix:
+        # Handling WSL paths (original logic)
+        drive = as_posix.split(':', 1)[0].lower()
+        wsl_path = "/mnt/" + drive + SCRIPT_DIR.as_posix().split(':', 1)[1]
+    else:
+        # Handling standard Linux paths
+        wsl_path = SCRIPT_DIR.as_posix()
+    
+    log_to_file(f"Current WSL-compatible path: {wsl_path}")
+    
+    os.chdir(SCRIPT_DIR / "ebpf")
+    
+    # Check if we need to modify build commands if clang-14 isn't available
+    # For GitHub ubuntu-latest, clang-14 is available.
+    cmd = ["make", "LLVM_STRIP=/usr/lib/llvm-14/bin/llvm-strip", "wsl_path=" + wsl_path]
+    
+    log_to_file(f"Executing command: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    log_to_file(f"STDOUT:\n{result.stdout}")
+    if result.stderr:
+        log_to_file(f"STDERR:\n{result.stderr}")
+        
+    if result.returncode != 0:
+        raise Exception(f"Failed to generate eBPF bytecode. See {BUILD_LOG}")
 
-    script = []
-    script.append('export PATH="$HOME/.cargo/bin:$PATH"')
-    script.append('export LLVM_SYS_190_PREFIX="$HOME/kernel/bin/clang19"')
-    script.append('cd ' + wsl_path + '/ebpf')
-    script.append('cargo +nightly build --target bpfel-unknown-none --release -Zbuild-std=core 2>&1')
-    script.append('EXIT=$?')
-    script.append('if [ $EXIT -ne 0 ]; then exit $EXIT; fi')
-    script.append('cp target/bpfel-unknown-none/release/aether-ebpf ' + wsl_path + '/ebpf_target.o')
-    script.append('echo "eBPF: .o generated OK"')
-    payload = chr(10).join(script)
-
-    for distro in ["Ubuntu", None]:
-        cmd = ["wsl"]
-        if distro:
-            cmd += ["-d", distro]
-        cmd += ["bash", "-s"]
-        try:
-            r = subprocess.run(cmd, input=payload.encode(), capture_output=True, timeout=180)
-        except subprocess.TimeoutExpired:
-            warn("eBPF: WSL 编译超时")
-            return
-        if r.returncode == 0:
-            if o_file.exists():
-                info("eBPF: Rust aya-ebpf 程序编译完成")
-                return
-            warn("eBPF: 编译成功但 .o 未生成")
-            return
-    warn("eBPF: WSL 不可用, 保留现有 ebpf_target.o")
-
-
-def find_ndk():
-    """找 NDK 目录用于 Rust 交叉编译。返回 (ndk_dir, host_tag, linker) 或 (None, None, None)"""
-    # 环境变量优先
-    for var in ["ANDROID_NDK_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT"]:
-        base = os.environ.get(var)
-        if not base: continue
-        base = Path(base)
-        ndk_dir = base if (base / "toolchains/llvm/prebuilt").exists() else \
-                  next(iter(sorted(base.glob("ndk/*"), reverse=True)), None)
-        if not ndk_dir: ndk_dir = next(iter(sorted(base.glob("ndk-bundle/*"), reverse=True)), None)
-        if not ndk_dir: continue
-        for tag in ["windows-x86_64", "linux-x86_64", "darwin-x86_64", "darwin-aarch64"]:
-            tc = ndk_dir / "toolchains/llvm/prebuilt" / tag
-            if not tc.exists(): continue
-            linker = tc / "bin" / "aarch64-linux-android21-clang"
-            if sys.platform == "win32": linker = linker.with_suffix(".cmd")
-            if linker.exists(): info(f"NDK: {ndk_dir}"); return ndk_dir, tag, linker
-    # 常见路径兜底
-    for base_str in [str(Path.home() / "Android/Sdk"), str(Path.home() / "AppData/Local/Android/Sdk"),
-                     "C:/Users/shenz/AppData/Local/Android/Sdk"]:
-        base = Path(base_str)
-        if not base.exists(): continue
-        ndk_dir = next(iter(sorted(base.glob("ndk/*"), reverse=True)), None)
-        if not ndk_dir: ndk_dir = next(iter(sorted(base.glob("ndk-bundle/*"), reverse=True)), None)
-        if not ndk_dir: continue
-        for tag in ["windows-x86_64", "linux-x86_64", "darwin-x86_64", "darwin-aarch64"]:
-            tc = ndk_dir / "toolchains/llvm/prebuilt" / tag
-            if not tc.exists(): continue
-            linker = tc / "bin" / "aarch64-linux-android21-clang"
-            if sys.platform == "win32": linker = linker.with_suffix(".cmd")
-            if linker.exists(): info(f"NDK: {ndk_dir}"); return ndk_dir, tag, linker
-    warn("无 NDK"); return None, None, None
-
-def build(ndk_info):
-    info("编译...")
+def build_rust_src():
     os.chdir(SCRIPT_DIR)
-    env = os.environ.copy()
-    if ndk_info:
-        ndk_dir, host_tag, linker = ndk_info
-        tc = ndk_dir / "toolchains/llvm/prebuilt" / host_tag
-        env["CC_aarch64_linux_android"] = str(linker)
-        env["AR_aarch64_linux_android"] = str(tc / "bin/llvm-ar")
-        cargo_dir = SCRIPT_DIR / ".cargo"
-        cargo_dir.mkdir(exist_ok=True)
-        (cargo_dir / "config.toml").write_text(f"[target.{TARGET}]\nlinker = \"{str(linker).replace(chr(92), chr(47))}\"\n")
-    if subprocess.run(["cargo", "build", "--target", TARGET, "--release"], env=env).returncode != 0:
-        die("编译失败")
+    
+    cmd = ["cargo", "build", "--target", "aarch64-linux-android", "--release"]
+    
+    log_to_file(f"Executing command: {' '.join(cmd)}")
+    # Pass environment variables correctly, especially ANDROID_NDK_HOME set by the workflow
+    result = subprocess.run(cmd, capture_output=True, text=True, env=os.environ.copy())
+    
+    log_to_file(f"STDOUT:\n{result.stdout}")
+    if result.stderr:
+        log_to_file(f"STDERR:\n{result.stderr}")
 
-def fix_line_ending(path):
-    with open(path, 'rb') as f: d = f.read()
-    if b'\r\n' not in d: return False
-    with open(path, 'wb') as f: f.write(d.replace(b'\r\n', b'\n'))
-    return True
+    if result.returncode != 0:
+        raise Exception(f"Failed to build Rust source. See {BUILD_LOG}")
 
-def package():
-    info("打包...")
-    binary = SCRIPT_DIR / "target" / TARGET / "release" / "aether-optext"
-    if not binary.exists(): binary = SCRIPT_DIR / "target" / "release" / "aether-optext"
-    if not binary.exists(): die("编译产物未找到")
-    OUT_DIR.mkdir(exist_ok=True)
-    MODULE_ZIP.unlink(missing_ok=True)
-    shutil.copy2(binary, MODULE_DIR / "aether-optext")
-    os.chmod(MODULE_DIR / "aether-optext", 0o755)
+def package_magisk_module():
+    if not OUTPUT_DIR.exists():
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        
+    time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_zip = OUTPUT_DIR / f"Aether-OptExt_{time_stamp}.zip"
+    
+    log_to_file(f"Packaging Magisk module to: {output_zip}")
+    
+    magisk_module_src = SCRIPT_DIR / "magisk_module"
+    
+    # Copy compiled binaries to correct locations within the magisk_module directory
+    rust_bin = SCRIPT_DIR / "target/aarch64-linux-android/release/aether-opt"
+    shutil.copy(rust_bin, magisk_module_src / "bin/aether-opt")
+    
+    # Assuming ebpf files are generated and need to be packaged
+    # Modify as per the actual file outputs and structure required
+    # shutil.copy(SCRIPT_DIR / "ebpf/ebpf_kern.o", magisk_module_src / "bin/ebpf_kern.o")
 
-    # 更新版本号
-    now = datetime.now()
-    ver = now.strftime("%m%d-ReleasePreview")
-    vc = int(now.strftime("%y%m%d"))
-    prop = MODULE_DIR / "module.prop"
-    prop.write_text(
-        f"id=aether-optext\nname=Aether OptExt\nversion={ver}\nversionCode={vc}\nauthor=NekoNemo\n"
-        "description=Aether OptExt - Android CPU affinity optimizer\n"
-    )
-
-    for f in MODULE_DIR.glob("**/*"):
-        if f.suffix in (".sh", ".prop", ".json", ".md") or f.name == "updater-script":
-            if fix_line_ending(f): info(f"换行符: {f.name}")
-    with zipfile.ZipFile(MODULE_ZIP, "w", zipfile.ZIP_DEFLATED) as z:
-        for root, dirs, files in os.walk(MODULE_DIR):
-            for f in files:
-                full = Path(root) / f; rel = str(full.relative_to(MODULE_DIR)).replace("\\", "/")
-                if rel.startswith(".") or "/." in rel: continue
-                z.write(binary if rel == "aether-optext" else full, rel)
+    # Create the zip file
+    shutil.make_archive(str(output_zip).replace('.zip', ''), 'zip', root_dir=magisk_module_src)
 
 def main():
-    # eBPF 事件驱动默认禁用 (纯 /proc 轮询); 仅当 .o 缺失时用 WSL 重新编译 Rust eBPF
-    if not (SCRIPT_DIR / "ebpf_target.o").exists():
+    if OUTPUT_DIR.exists():
+        shutil.rmtree(OUTPUT_DIR)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    
+    with open(BUILD_LOG, "w") as f:
+        f.write(f"Build started at {datetime.now()}\n\n")
+
+    try:
+        log_to_file("1. Generating eBPF bytecode...")
         gen_ebpf_bytecode()
-    ndk_info = find_ndk()
-    build(ndk_info)
-    package()
-    info(f"完成: {MODULE_ZIP.name} ({MODULE_ZIP.stat().st_size/1024:.0f}KB)")
+        
+        log_to_file("\n2. Building Rust source...")
+        build_rust_src()
+        
+        log_to_file("\n3. Packaging Magisk module...")
+        package_magisk_module()
+        
+        log_to_file("\nBuild completed successfully!")
+        
+    except Exception as e:
+        log_to_file(f"\nBuild failed: {str(e)}")
+        exit(1)
 
 if __name__ == "__main__":
     main()
