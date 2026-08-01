@@ -1,0 +1,39 @@
+name: Build Magisk Module
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android
+
+      - name: Set up Android NDK
+        uses: nbdime/setup-ndk@v1
+        with:
+          ndk-version: r25c
+          link-to-sdk: true
+
+      - name: Run Build Script
+        run: |
+          python build.py
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aether-OptExt-Module
+          path: out/*.zip
